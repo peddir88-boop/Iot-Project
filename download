@@ -1,0 +1,222 @@
+"""
+Processing layer:
+Subscribes to MQTT, validates sensor data,
+detects faults, enriches readings,
+and stores data in InfluxDB.
+"""
+
+import json
+import logging
+
+import requests
+import paho.mqtt.client as mqtt
+
+import config
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [SUB] %(message)s")
+log = logging.getLogger(__name__)
+
+
+class Processor:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.thresholds = cfg["thresholds"]
+        self.seen_messages = set()
+        self.count = 0
+
+        self.influx_url = cfg["influxdb"]["url"].rstrip("/")
+        self.database = cfg["influxdb"]["database"]
+        self.token = cfg["influxdb"].get("token", "")
+
+    def validate(self, data):
+        required_fields = (
+            "vehicle_id",
+            "zone",
+            "timestamp",
+            "temperature",
+            "humidity"
+        )
+
+        for field in required_fields:
+            if field not in data or data[field] is None:
+                return False, f"missing_{field}"
+
+        try:
+            data["temperature"] = float(data["temperature"])
+            data["humidity"] = float(data["humidity"])
+
+        except ValueError:
+            return False, "non_numeric_sensor_value"
+
+        temperature = data["temperature"]
+        humidity = data["humidity"]
+
+        if not (
+            self.thresholds["temp_min_valid"]
+            <= temperature
+            <= self.thresholds["temp_max_valid"]
+        ):
+            return False, "temperature_out_of_range"
+
+        if not (0 <= humidity <= 100):
+            return False, "humidity_out_of_range"
+
+        return True, None
+
+    def is_duplicate(self, data):
+        key = f"{data['vehicle_id']}|{data['timestamp']}"
+
+        if key in self.seen_messages:
+            return True
+
+        self.seen_messages.add(key)
+
+        if len(self.seen_messages) > 20000:
+            self.seen_messages = set(
+                list(self.seen_messages)[-10000:]
+            )
+
+        return False
+
+    def enrich(self, data):
+        temperature = data["temperature"]
+
+        data["alert"] = not (
+            self.thresholds["temp_alert_min"]
+            <= temperature
+            <= self.thresholds["temp_alert_max"]
+        )
+
+        return data
+
+    @staticmethod
+    def escape_tag(value):
+        return (
+            str(value)
+            .replace(" ", r"\ ")
+            .replace(",", r"\,")
+            .replace("=", r"\=")
+        )
+
+    def write_to_influxdb(self, data):
+        vehicle_id = self.escape_tag(data["vehicle_id"])
+        zone = self.escape_tag(data["zone"])
+        alert = str(data["alert"]).lower()
+        fault = self.escape_tag(data.get("fault") or "none")
+
+        line_protocol = (
+            f"temperature_reading,"
+            f"vehicle_id={vehicle_id},"
+            f"zone={zone},"
+            f"alert={alert},"
+            f"fault={fault} "
+            f"temperature={data['temperature']},"
+            f"humidity={data['humidity']}"
+        )
+
+        url = f"{self.influx_url}/api/v3/write_lp?db={self.database}"
+
+        headers = {
+            "Content-Type": "text/plain"
+        }
+
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+
+        response = requests.post(
+            url,
+            headers=headers,
+            data=line_protocol,
+            timeout=5
+        )
+
+        if response.status_code not in (200, 204):
+            raise RuntimeError(
+                f"{response.status_code} - {response.text}"
+            )
+
+    def handle_message(self, raw_payload):
+        try:
+            data = json.loads(raw_payload)
+
+        except json.JSONDecodeError as error:
+            log.warning("Malformed JSON dropped: %s", error)
+            return
+
+        valid, reason = self.validate(data)
+
+        if not valid:
+            log.warning(
+                "Invalid reading dropped (%s): %s",
+                reason,
+                data
+            )
+            return
+
+        if self.is_duplicate(data):
+            log.debug(
+                "Duplicate dropped: %s @ %s",
+                data.get("vehicle_id"),
+                data.get("timestamp")
+            )
+            return
+
+        enriched_data = self.enrich(data)
+
+        try:
+            self.write_to_influxdb(enriched_data)
+
+            self.count += 1
+
+            if self.count % 500 == 0:
+                log.info("Stored %d records", self.count)
+
+        except Exception as error:
+            log.error("InfluxDB write failed: %s", error)
+
+
+def run():
+    cfg = config.load()
+
+    processor = Processor(cfg)
+
+    def on_connect(client, userdata, flags, reason_code, properties):
+        log.info("Connected to MQTT broker")
+        log.info(
+            "Subscribing to topic: %s",
+            cfg["mqtt"]["topic"]
+        )
+
+        client.subscribe(
+            cfg["mqtt"]["topic"],
+            qos=cfg["mqtt"]["qos"]
+        )
+
+    def on_message(client, userdata, message):
+        processor.handle_message(message.payload)
+
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+
+    client.on_connect = on_connect
+    client.on_message = on_message
+
+    client.connect(
+        cfg["mqtt"]["host"],
+        cfg["mqtt"]["port"]
+    )
+
+    log.info("Subscriber started")
+
+    try:
+        client.loop_forever()
+
+    except KeyboardInterrupt:
+        log.info(
+            "Subscriber stopped. Total stored records: %d",
+            processor.count
+        )
+
+
+if __name__ == "__main__":
+    run()

@@ -1,0 +1,253 @@
+# Cold Chain Temperature Monitoring — IoT Data Pipeline
+
+A real-time IoT pipeline that simulates cold-chain sensor data, streams it through MQTT, processes and stores it in InfluxDB, and delivers live visualizations and machine learning anomaly detection through a Streamlit dashboard.
+
+---
+
+## Problem Statement
+
+Cold-chain logistics require products such as food and pharmaceuticals to remain within a safe temperature range of **2°C to 8°C**. Temperature deviations cause spoilage, financial losses, and health risks, while traditional monitoring systems often lack real-time visibility and automated alerting. This pipeline provides continuous monitoring, automated breach detection, and ML-based anomaly identification across multiple vehicles and zones.
+
+---
+
+## Architecture
+
+```
+[simulator.py] → MQTT (Mosquitto) → [subscriber.py] → InfluxDB
+                                                           ↓
+                                                   [dashboard.py]
+                                              Viz 1 | Viz 2 | ML
+```
+
+> See `images/architecture.png` for the full diagram.
+
+| Component | Choice | Justification |
+|---|---|---|
+| Protocol | MQTT (QoS 1) | Lightweight, low overhead, at-least-once delivery — ideal for intermittent sensor connections |
+| Processing | Python subscriber | Validates, deduplicates, and enriches readings before storage |
+| Database | InfluxDB | Native time-series storage; tags are indexed for fast filtering by vehicle and zone |
+| Output | Streamlit | Pure Python, no frontend code needed; live auto-refresh built in |
+| ML | Isolation Forest | Unsupervised — no labelled anomaly data required; effective on 2D sensor features |
+
+---
+
+## Project Structure
+
+```
+cold-chain-iot/
+├── config/
+│   └── config.yaml          # all tuneable settings (broker, DB, thresholds)
+├── scripts/
+│   ├── run.sh               # Linux/macOS: starts subscriber + simulator
+│   └── run.ps1              # Windows: starts subscriber + simulator
+├── src/
+│   ├── __init__.py
+│   ├── config.py            # shared config loader
+│   ├── simulator.py         # device layer — realistic sensor simulation + fault injection
+│   ├── subscriber.py        # processing layer — validate, enrich, write to InfluxDB
+│   ├── ml.py                # ML module — Isolation Forest anomaly detection
+│   └── dashboard.py         # output layer — Streamlit visualisations + ML results
+├── images/
+│   └── architecture.png
+├── README.md
+└── .gitignore
+```
+
+---
+
+## Database Schema
+
+**Measurement:** `temperature_reading`
+
+| Kind | Name | Type | Description |
+|---|---|---|---|
+| Tag | `vehicle_id` | string | Vehicle identifier (V001–V003) — indexed |
+| Tag | `zone` | string | warehouse / transit / delivery — indexed |
+| Tag | `alert` | string | "True" if outside 2–8 °C safe range |
+| Field | `temperature` | float | Temperature reading in °C |
+| Field | `humidity` | float | Relative humidity in % |
+| Field | `fault` | string | Fault type: none / spike / duplicate / delay |
+| Timestamp | `time` | nanosecond UTC | Set from sensor payload |
+
+Tags are indexed so queries filtering by vehicle or zone are fast. Fields hold the actual measurements and are not indexed.
+
+### Sample Flux query
+
+```flux
+from(bucket: "coldchain")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "temperature_reading")
+  |> filter(fn: (r) => r._field == "temperature")
+  |> filter(fn: (r) => r.vehicle_id == "V001")
+  |> mean()
+```
+
+### Sample SQL query (InfluxDB 3)
+
+```sql
+SELECT time, vehicle_id, zone, temperature, humidity, alert, fault
+FROM temperature_reading
+ORDER BY time DESC
+LIMIT 50;
+```
+
+---
+
+## Setup
+
+### 1. Install Mosquitto
+
+```bash
+# macOS
+brew install mosquitto && brew services start mosquitto
+
+# Ubuntu / Debian
+sudo apt install mosquitto mosquitto-clients -y && sudo systemctl start mosquitto
+
+# Windows — download installer from https://mosquitto.org/download/
+mosquitto -v
+```
+
+### 2. Install InfluxDB
+
+Follow the official guide: https://docs.influxdata.com/influxdb/v2/install/
+
+Once running, open http://localhost:8086 and complete the following:
+1. Create an organisation named `iot-project`
+2. Create a bucket named `coldchain`
+3. Generate an API token with read/write access to that bucket
+
+### 3. Set your InfluxDB token
+
+**macOS / Linux**
+```bash
+export INFLUXDB_TOKEN="your_token_here"
+```
+
+**Windows PowerShell**
+```powershell
+$env:INFLUXDB_TOKEN="your_token_here"
+```
+
+Or paste it directly into `config/config.yaml`:
+```yaml
+influxdb:
+  token: YOUR_TOKEN_HERE
+```
+
+> Do not commit a real token to a public repository.
+
+---
+
+## Running
+
+Open **three terminals** from the project root.
+
+**Terminal 1 — subscriber (processing + storage)**
+```bash
+python src/subscriber.py
+```
+
+**Terminal 2 — simulator (device layer)**
+```bash
+python src/simulator.py
+```
+
+**Terminal 3 — dashboard (output)**
+```bash
+python -m streamlit run src/dashboard.py
+```
+
+Then open http://localhost:8501 in your browser.
+
+**Or use the convenience script** to start subscriber + simulator together:
+
+```bash
+# Linux / macOS
+bash scripts/run.sh
+
+# Windows
+.\scripts\run.ps1
+```
+
+> Dependencies install automatically on first run — no `pip install` step needed.
+
+The simulator publishes approximately **30 records per second** across 3 vehicles. **10,000 records are collected in roughly 6 minutes.**
+
+---
+
+## Dataset Summary
+
+| Property | Value |
+|---|---|
+| Total records | 10,000+ |
+| Vehicles | 3 (V001, V002, V003) |
+| Zones | warehouse, transit, delivery |
+| Cold-chain alerts | ~133 |
+| Anomalies detected | ~500 |
+| Estimated anomaly rate | 5% |
+
+---
+
+## Fault Injection
+
+The simulator injects the following faults at a configurable rate (default 5%):
+
+| Fault | Behaviour | How it is handled |
+|---|---|---|
+| Spike | Temperature set to 14–28 °C | Out-of-range validation drops it |
+| Dropout | Message not published at all | Gap visible in time-series chart |
+| Duplicate | Same payload sent twice | Deduplication on `vehicle_id + timestamp` |
+| Delay | Random 1.5–3.5 s sleep before publish | InfluxDB timestamp preserves order |
+
+---
+
+## Visualizations
+
+**Viz 1 — Temperature over time by vehicle**
+Live-updating line chart showing each vehicle's temperature trend at 1-minute resolution. Useful for spotting sudden spikes and sustained breaches during transport.
+
+**Viz 2 — Temperature distribution by zone**
+Bar chart and statistics table (mean, min, max, std) comparing average temperatures across warehouse, transit, and delivery zones. Highlights operational differences between zones.
+
+**ML — Isolation Forest scatter plot**
+Scatter of temperature vs humidity, with anomalies highlighted in red. Surfaces unusual sensor combinations that threshold rules alone would not catch.
+
+---
+
+## Machine Learning
+
+The Isolation Forest algorithm is used for unsupervised anomaly detection.
+
+- **Input features:** temperature, humidity
+- **Contamination:** 5% (expected proportion of anomalies)
+- **Why Isolation Forest:** requires no labelled training data; effective at detecting outliers in low-dimensional sensor data
+- **Output:** each reading is labelled normal or anomalous; anomalous readings are surfaced in the dashboard with vehicle, zone, and sensor values
+- **Decision use:** anomaly flags can trigger alerts for maintenance teams or flag shipments for inspection
+
+---
+
+## Scalability
+
+| Current design | Enterprise upgrade |
+|---|---|
+| Single Mosquitto broker | Clustered broker (HiveMQ, EMQX) with load balancing |
+| Python subscriber (single process) | Kafka consumer group for parallel processing |
+| Local InfluxDB | InfluxDB Cloud or TimescaleDB on managed infrastructure |
+| Streamlit dashboard | Grafana with live InfluxDB datasource |
+| Isolation Forest re-trains per request | Pre-trained model served via MLflow or a REST API |
+| 3 simulated vehicles | Real ESP32 hardware with physical DHT22 sensors |
+
+---
+
+## Challenges and Lessons Learned
+
+Configuring InfluxDB authentication and API token access required careful setup. MQTT publisher and subscriber synchronisation needed testing to avoid dropped messages on startup. Managing real-time auto-refresh in Streamlit required balancing cache TTL against responsiveness. The project reinforced how data validation and fault handling are as important as the pipeline logic itself, and how multiple technologies can integrate cleanly through a shared configuration file.
+
+---
+
+## Notes
+
+- Remove all `__pycache__` folders before submitting or pushing to GitHub
+- Ensure InfluxDB and Mosquitto are running before starting the subscriber or simulator
+- All tuneable values (thresholds, intervals, fault rates) are in `config/config.yaml` — no code changes needed
